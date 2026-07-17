@@ -102,11 +102,14 @@ func (e *Executor) Execute(transferID string, opts RcloneOptions) error {
 		return fmt.Errorf("failed to start rclone: %w", err)
 	}
 
-	// Parse stderr for progress in a goroutine
+	// Parse stderr for progress in a goroutine, capturing rclone's non-progress
+	// output (errors/warnings) so a failure can report *why* rather than a bare
+	// "exit status 1".
 	done := make(chan struct{})
+	var stderrTail []string
 	go func() {
 		defer close(done)
-		parseRcloneOutput(bufio.NewReader(stderr), transferID, e.manager)
+		stderrTail = parseRcloneOutput(bufio.NewReader(stderr), transferID, e.manager)
 	}()
 
 	// Wait for command to complete
@@ -115,11 +118,20 @@ func (e *Executor) Execute(transferID string, opts RcloneOptions) error {
 	// Wait for parsing to finish
 	<-done
 
+	// On failure, surface rclone's own diagnostic lines. Without this the caller
+	// only sees the exit code, so a stalled/errored transfer is indistinguishable
+	// from a silent hang.
+	if cmdErr != nil && len(stderrTail) > 0 {
+		return fmt.Errorf("%w: %s", cmdErr, strings.Join(stderrTail, "; "))
+	}
+
 	return cmdErr
 }
 
-// parseRcloneOutput parses rclone output to extract progress information
-func parseRcloneOutput(reader *bufio.Reader, transferID string, mgr *Manager) {
+// parseRcloneOutput parses rclone output to extract progress information and
+// returns the last few non-progress lines (rclone's errors/warnings) for use in
+// diagnostics when the command fails.
+func parseRcloneOutput(reader *bufio.Reader, transferID string, mgr *Manager) []string {
 	// With -v flag, rclone outputs progress lines to stderr like:
 	//   "Transferred:   100 MiB / 2.5 GiB, 4%, 45.2 MiB/s, ETA 50s"
 	// Note: rclone uses \r (carriage return) to update progress in place
@@ -163,6 +175,11 @@ func parseRcloneOutput(reader *bufio.Reader, transferID string, mgr *Manager) {
 	// Example: "Transferred:   1.234 GiB / 5.678 GiB, 22%, 10 MiB/s, ETA 1m30s"
 	statsRegex := regexp.MustCompile(`Transferred:\s+([0-9.]+)\s*([kKMGTP]i?[Bb]?)\s*/\s*([0-9.]+)\s*([kKMGTP]i?[Bb]?),\s*([0-9]+)%`)
 
+	// Ring buffer of the most recent non-progress lines, bounded so a chatty
+	// transfer can't grow this without limit.
+	const maxTail = 10
+	tail := make([]string, 0, maxTail)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -180,8 +197,17 @@ func parseRcloneOutput(reader *bufio.Reader, transferID string, mgr *Manager) {
 				total := parseSize(matches[3], matches[4])
 				mgr.UpdateProgress(transferID, percentage, copied, total)
 			}
+			continue // progress line: not useful as diagnostic text
 		}
+
+		// Non-progress line (errors, warnings, summary): keep the last maxTail.
+		if len(tail) == maxTail {
+			tail = tail[1:]
+		}
+		tail = append(tail, line)
 	}
+
+	return tail
 }
 
 // parseSize converts size string to bytes (e.g., "1.234" with unit "GiB")
